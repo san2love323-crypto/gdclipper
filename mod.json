@@ -1,0 +1,12 @@
+{
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081"
+	},
+	"id": "yujun566.gdclipper",
+	"name": "GD Clipper",
+	"version": "v1.0.0",
+	"developer": "yujun566",
+	"description": "Sends level events (attempt, death, complete, quit) to the GD Clipper recorder app so it can save your clears as mp4.",
+	"tags": ["utility", "offline"]
+}
