@@ -16,12 +16,16 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef GEODE_IS_WINDOWS
 #include <Windows.h>
 #include <commdlg.h>
+#include <objbase.h>
+#include <wincodec.h>
 #endif
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -418,32 +422,86 @@ protected:
     void onClear(CCObject*) { pushUndo(); m_icon[m_layer].fill(ip::Px{}); redraw(); }
     void onUse(CCObject*) { m_enabled = !m_enabled; m_dirty = true; updateStatus(); }
 
+    // The file dialog and the decoding run on their own thread, so the game keeps running and the
+    // button click can never be delivered twice (that is what kept re-opening the dialog before).
     void onImport(CCObject*) {
 #ifdef GEODE_IS_WINDOWS
-        wchar_t path[1024] = L"";
-        OPENFILENAMEW ofn{};
-        ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = GetActiveWindow();
-        ofn.lpstrFilter = L"Images (*.jpg;*.jpeg;*.png;*.bmp)\0*.jpg;*.jpeg;*.png;*.bmp\0All files\0*.*\0";
-        ofn.lpstrFile = path;
-        ofn.nMaxFile = 1024;
-        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if (!GetOpenFileNameW(&ofn)) return;
+        if (s_importBusy.exchange(true)) return;
+        this->retain();
+        std::thread([this] {
+            std::vector<uint8_t> rgba; int w = 0, h = 0; std::string err; bool cancelled = false;
+            wchar_t path[1024] = L"";
+            OPENFILENAMEW ofn{};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.lpstrFilter = L"Images (*.jpg;*.jpeg;*.png;*.bmp;*.webp;*.gif)\0*.jpg;*.jpeg;*.png;*.bmp;*.webp;*.gif\0All files\0*.*\0";
+            ofn.lpstrFile = path;
+            ofn.nMaxFile = 1024;
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
+            if (!GetOpenFileNameW(&ofn)) cancelled = true;
+            else if (!decodeImage(path, rgba, w, h)) err = "That image could not be read.\nTry saving it again as PNG or JPG.";
+            queueInMainThread([this, rgba = std::move(rgba), w, h, err, cancelled] {
+                s_importBusy = false;
+                if (!cancelled) {
+                    if (!err.empty()) showMsg(err.c_str());
+                    else finishImport(rgba, w, h);
+                }
+                this->release();
+            });
+        }).detach();
+#else
+        showMsg("Image import is Windows only.");
+#endif
+    }
+    static inline std::atomic<bool> s_importBusy{false};
 
+#ifdef GEODE_IS_WINDOWS
+    // stb_image first (JPG / PNG / BMP); if that fails, Windows' own decoder (also WebP, GIF, CMYK JPG, ...)
+    static bool decodeImage(const wchar_t* path, std::vector<uint8_t>& out, int& w, int& h) {
         FILE* f = nullptr;
         _wfopen_s(&f, path, L"rb");
-        if (!f) { showMsg("Could not open that file."); return; }
-        std::vector<uint8_t> bytes;
-        uint8_t chunk[65536]; size_t n;
-        while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) bytes.insert(bytes.end(), chunk, chunk + n);
-        fclose(f);
+        if (f) {
+            std::vector<uint8_t> bytes;
+            uint8_t chunk[65536]; size_t n;
+            while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) bytes.insert(bytes.end(), chunk, chunk + n);
+            fclose(f);
+            int comp = 0;
+            uint8_t* img = bytes.empty() ? nullptr : stbi_load_from_memory(bytes.data(), (int)bytes.size(), &w, &h, &comp, 4);
+            if (img && w > 0 && h > 0) {
+                out.assign(img, img + (size_t)w * h * 4);
+                stbi_image_free(img);
+                return true;
+            }
+            if (img) stbi_image_free(img);
+        }
 
-        int w = 0, h = 0, comp = 0;
-        uint8_t* img = stbi_load_from_memory(bytes.data(), (int)bytes.size(), &w, &h, &comp, 4);
-        if (!img || w < 1 || h < 1) { if (img) stbi_image_free(img); showMsg("That image could not be read.\nUse JPG, PNG or BMP."); return; }
+        bool ok = false;
+        HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        IWICImagingFactory* fac = nullptr; IWICBitmapDecoder* dec = nullptr;
+        IWICBitmapFrameDecode* frame = nullptr; IWICFormatConverter* conv = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac))) &&
+            SUCCEEDED(fac->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) &&
+            SUCCEEDED(dec->GetFrame(0, &frame)) &&
+            SUCCEEDED(fac->CreateFormatConverter(&conv)) &&
+            SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
+            UINT uw = 0, uh = 0;
+            if (SUCCEEDED(conv->GetSize(&uw, &uh)) && uw > 0 && uh > 0 && uw <= 16384 && uh <= 16384) {
+                out.resize((size_t)uw * uh * 4);
+                if (SUCCEEDED(conv->CopyPixels(nullptr, uw * 4, (UINT)out.size(), out.data()))) { w = (int)uw; h = (int)uh; ok = true; }
+            }
+        }
+        if (conv) conv->Release();
+        if (frame) frame->Release();
+        if (dec) dec->Release();
+        if (fac) fac->Release();
+        if (SUCCEEDED(co)) CoUninitialize();
+        return ok;
+    }
+#endif
 
-        // centre-crop to a square, then average down to N x N
+    // centre-crop to a square, average down to N x N, put it in L3
+    void finishImport(std::vector<uint8_t> const& img, int w, int h) {
         using namespace ip;
+        if (w < 1 || h < 1 || img.size() < (size_t)w * h * 4) { showMsg("That image could not be read."); return; }
         int side = (std::min)(w, h), ox = (w - side) / 2, oy = (h - side) / 2;
         pushUndo();
         for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
@@ -462,11 +520,7 @@ protected:
             }
             m_icon[2][y * N + x] = out;
         }
-        stbi_image_free(img);
         m_layer = 2; rebuildPalette(); updateStatus(); redraw();
-#else
-        showMsg("Image import is Windows only.");
-#endif
     }
 
     void showMsg(const char* text) { FLAlertLayer::create("Icon Painter", text, "OK")->show(); }
