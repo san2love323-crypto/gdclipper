@@ -413,7 +413,8 @@ protected:
         ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         if (!GetOpenFileNameW(&ofn)) return;
 
-        FILE* f = _wfopen(path, L"rb");
+        FILE* f = nullptr;
+        _wfopen_s(&f, path, L"rb");
         if (!f) { showMsg("Could not open that file."); return; }
         std::vector<uint8_t> bytes;
         uint8_t chunk[65536]; size_t n;
@@ -499,7 +500,7 @@ protected:
 
         // canvas
         m_canvasSize = (std::min)(210.f, win.height - 90.f);
-        m_canvasPos = {win.width / 2, win.height / 2 + 6};
+        m_canvasPos = CCPoint(win.width / 2, win.height / 2 + 6);
         auto frame = CCLayerColor::create({0, 0, 0, 160}, m_canvasSize + 8, m_canvasSize + 8);
         frame->setPosition({m_canvasPos.x - m_canvasSize / 2 - 4, m_canvasPos.y - m_canvasSize / 2 - 4});
         this->addChild(frame);
