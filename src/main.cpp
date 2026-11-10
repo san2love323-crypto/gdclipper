@@ -1,4 +1,4 @@
-// Icon Painter — draw your own cube icon inside Geometry Dash (Geode mod, GD 2.2091, Windows)
+// Icon Painter — draw your own cube icon inside Geometry Dash (Geode mod, GD 2.2081, Windows)
 //
 // Layers (same stacking the game uses for icons):
 //   L2 (bottom)  = tinted with player color 2
@@ -190,10 +190,27 @@ class $modify(IPSimplePlayer, SimplePlayer) {
 };
 
 class $modify(IPPlayerObject, PlayerObject) {
+    // true while the player sprite is showing a cube (cube itself, or the cube riding a ship / ufo / jetpack)
+    bool showsCube() {
+        return !m_isBall && !m_isDart && !m_isSwing && !m_isRobot && !m_isSpider;
+    }
+
+    void applyPainted() {
+        if (!m_iconSprite || !showsCube() || !ip::ready()) return;
+        if (m_iconSprite->isFrameDisplayed(ip::g_frame[0])) return;      // already ours
+        ip::apply(m_iconSprite, m_iconSpriteSecondary, m_iconSpriteWhitener, m_iconGlow);
+    }
+
     void updatePlayerFrame(int frame) {
         PlayerObject::updatePlayerFrame(frame);
-        if (!ip::ready()) return;
-        ip::apply(m_iconSprite, m_iconSpriteSecondary, m_iconSpriteWhitener, m_iconGlow);
+        applyPainted();
+    }
+
+    // The game also swaps the cube frame from places that never go through updatePlayerFrame
+    // (level start, respawn, leaving ball / wave / robot ...), so re-check every frame. It is one cheap compare.
+    void update(float dt) {
+        PlayerObject::update(dt);
+        applyPainted();
     }
 };
 
