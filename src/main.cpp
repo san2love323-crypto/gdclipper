@@ -1,521 +1,611 @@
-// GD Clipper v2.1 - standalone Geode mod (no companion app)
-// While you are inside a level, frames are recorded into 2-second segments by an ffmpeg child process.
-// Capture methods: ingame (reads the game framebuffer, default), ddagrab / gdigrab (grab the desktop).
-// On a clear:  cut version (winning attempt)  +  full version (level enter -> clear).   Quit without a clear: discarded.
+// Icon Painter — draw your own cube icon inside Geometry Dash (Geode mod, GD 2.2091, Windows)
+//
+// Layers (same stacking the game uses for icons):
+//   L2 (bottom)  = tinted with player color 2
+//   L1 (middle)  = tinted with player color 1
+//   L3 (top)     = fixed colors, never tinted  (outlines, eyes, imported photos)
+//
+// Only cocos2d-x + GD classes are used for UI (no Geode UI helpers), so it stays buildable across Geode versions.
 #include <Geode/Geode.hpp>
-#include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/CCEGLView.hpp>
-#include <windows.h>
-#include <atomic>
-#include <mutex>
-#include <condition_variable>
-#include <deque>
-#include <memory>
-#include <thread>
-#include <chrono>
+#include <Geode/modify/GJGarageLayer.hpp>
+#include <Geode/modify/SimplePlayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
-#include <fstream>
-#include <filesystem>
-#include <cstdio>
-#include <ctime>
-#include <cstdint>
+
+#ifdef GEODE_IS_WINDOWS
+#include <Windows.h>
+#include <commdlg.h>
+#endif
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#define STBI_ONLY_BMP
+#define STBI_NO_STDIO
+#include "stb_image.h"
 
 using namespace geode::prelude;
-namespace fs = std::filesystem;
 
-namespace clip {
+// =====================================================================================
+// Icon data
+// =====================================================================================
+namespace ip {
 
-constexpr double SEG = 2.0;                       // segment length, seconds
+constexpr int N = 32;            // canvas is N x N pixels
+constexpr int LAYERS = 3;        // 0 = L1 (color 1), 1 = L2 (color 2), 2 = L3 (fixed)
+constexpr float ICON_UNITS = 30.f;
 
-static std::mutex g_mx;
-static HANDLE g_ff = nullptr;                     // recording ffmpeg process
-static HANDLE g_job = nullptr;                    // kills ffmpeg when the game exits
-static std::atomic<double> g_t0{0.0};             // QPC time of the first recorded frame (0 = not yet known)
-static std::atomic<double> g_attempt{0.0};        // QPC time the current attempt started
-static std::atomic<int> g_session{0};             // bumped on every start/stop, so stale threads can tell
-static std::atomic<bool> g_saving{false};
-static std::atomic<bool> g_stopAfterSave{false};
-static std::atomic<bool> g_ffReady{false};
-static std::atomic<bool> g_ffDownloading{false};
-static std::atomic<bool> g_usedFallback{false};
+struct Px { uint8_t r = 0, g = 0, b = 0, a = 0; };
+using Layer = std::array<Px, N * N>;
+using Icon = std::array<Layer, LAYERS>;
 
-static double now() {
-    LARGE_INTEGER f, c;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return (double)c.QuadPart / (double)f.QuadPart;
+Icon g_icon{};                   // the saved icon
+bool g_hasIcon = false;
+bool g_enabled = false;
+
+// sprite frames built from g_icon (null until built)
+CCSpriteFrame* g_frame[LAYERS] = {nullptr, nullptr, nullptr};
+CCSpriteFrame* g_glowFrame = nullptr;
+float g_builtScale = 0.f;
+
+// ---------- save / load (hex string in the mod's saved values) ----------
+std::string toHex(Icon const& ic) {
+    static const char* H = "0123456789abcdef";
+    std::string s; s.reserve(LAYERS * N * N * 8);
+    for (auto const& l : ic) for (auto const& p : l)
+        for (uint8_t v : {p.r, p.g, p.b, p.a}) { s.push_back(H[v >> 4]); s.push_back(H[v & 15]); }
+    return s;
 }
-
-static void notify(std::string msg, bool ok = true) {
-    Loader::get()->queueInMainThread([msg, ok] {
-        Notification::create(msg, ok ? NotificationIcon::Success : NotificationIcon::Error)->show();
-    });
-}
-
-static fs::path saveDir()   { return Mod::get()->getSaveDir(); }
-static fs::path bufDir()    { return saveDir() / "buffer"; }
-static fs::path ffmpegExe() { return saveDir() / "ffmpeg.exe"; }
-
-static std::wstring widen(const std::string& s) {
-    if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
-    return w;
-}
-
-static fs::path outDir() {
-    auto s = Mod::get()->getSettingValue<std::string>("out-dir");
-    if (!s.empty()) return fs::path(widen(s));
-    const wchar_t* home = _wgetenv(L"USERPROFILE");
-    return fs::path(home ? home : L"C:\\") / L"Videos" / L"GD Clips";
-}
-
-static std::wstring segName(int i) {
-    wchar_t b[32];
-    swprintf(b, 32, L"seg%06d.mp4", i);
-    return b;
-}
-
-// ---- process helpers -------------------------------------------------------------------------------
-// Runs a command line hidden. wait=true blocks and returns the exit code; wait=false returns the process handle in *out.
-static bool run(std::wstring cmd, const fs::path& cwd, bool wait, HANDLE* out = nullptr, DWORD* exitCode = nullptr) {
-    STARTUPINFOW si{};
-    si.cb = sizeof si;
-    PROCESS_INFORMATION pi{};
-    std::wstring dir = cwd.wstring();
-    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
-        log::error("CreateProcess failed: {}", GetLastError());
-        return false;
+bool fromHex(std::string const& s, Icon& ic) {
+    if (s.size() != (size_t)LAYERS * N * N * 8) return false;
+    auto hv = [](char c) -> int { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : 0; };
+    size_t i = 0;
+    for (auto& l : ic) for (auto& p : l) {
+        uint8_t v[4];
+        for (auto& x : v) { x = (uint8_t)(hv(s[i]) * 16 + hv(s[i + 1])); i += 2; }
+        p = {v[0], v[1], v[2], v[3]};
     }
-    CloseHandle(pi.hThread);
-    if (g_job) AssignProcessToJobObject(g_job, pi.hProcess);
-    if (wait) {
-        WaitForSingleObject(pi.hProcess, 15 * 60 * 1000);
-        DWORD code = 1;
-        GetExitCodeProcess(pi.hProcess, &code);
-        if (exitCode) *exitCode = code;
-        CloseHandle(pi.hProcess);
-        return code == 0;
-    }
-    if (out) *out = pi.hProcess; else CloseHandle(pi.hProcess);
     return true;
 }
+void load() {
+    g_enabled = Mod::get()->getSavedValue<bool>("enabled", false);
+    g_hasIcon = fromHex(Mod::get()->getSavedValue<std::string>("icon", ""), g_icon);
+}
+void save() {
+    Mod::get()->setSavedValue<std::string>("icon", toHex(g_icon));
+    Mod::get()->setSavedValue<bool>("enabled", g_enabled);
+    g_hasIcon = true;
+}
 
-static std::wstring q(const fs::path& p) { return L"\"" + p.wstring() + L"\""; }
+// ---------- textures ----------
+CCTexture2D* makeTexture(std::vector<uint8_t> const& rgba, int w, int h) {
+    auto tex = new CCTexture2D();
+    tex->initWithData(rgba.data(), kCCTexture2DPixelFormat_RGBA8888, w, h, CCSize((float)w, (float)h));
+    tex->setAliasTexParameters();   // crisp pixels
+    tex->autorelease();
+    return tex;
+}
+CCSpriteFrame* makeFrame(std::vector<uint8_t> const& rgba, int w, int h) {
+    auto tex = makeTexture(rgba, w, h);
+    auto sz = tex->getContentSize();
+    auto fr = CCSpriteFrame::createWithTexture(tex, CCRect(0, 0, sz.width, sz.height));
+    fr->retain();
+    return fr;
+}
 
-// ---- ffmpeg download (first run) -------------------------------------------------------------------
-static void ensureFfmpeg() {
-    std::error_code ec;
-    fs::create_directories(saveDir(), ec);
-    if (fs::exists(ffmpegExe(), ec)) { g_ffReady = true; return; }
-    // reuse the copy the old GD Clipper app downloaded, if there is one
-    if (const wchar_t* appdata = _wgetenv(L"APPDATA")) {
-        fs::path old = fs::path(appdata) / L"GDClipper" / L"ffmpeg.exe";
-        if (fs::exists(old, ec)) {
-            fs::copy_file(old, ffmpegExe(), fs::copy_options::overwrite_existing, ec);
-            if (!ec) { g_ffReady = true; return; }
+// Build the 3 layer frames + a glow frame from g_icon, sized like a real cube (30 units).
+void buildFrames() {
+    for (auto& f : g_frame) { CC_SAFE_RELEASE_NULL(f); }
+    CC_SAFE_RELEASE_NULL(g_glowFrame);
+    if (!g_hasIcon) return;
+
+    float csf = CCDirector::sharedDirector()->getContentScaleFactor();
+    g_builtScale = csf;
+    int T = (std::max)(N, (int)std::lround(ICON_UNITS * csf));   // texture pixels per side
+
+    for (int l = 0; l < LAYERS; l++) {
+        std::vector<uint8_t> buf((size_t)T * T * 4);
+        for (int y = 0; y < T; y++) for (int x = 0; x < T; x++) {
+            auto const& p = g_icon[l][(y * N / T) * N + (x * N / T)];   // nearest neighbour upscale
+            uint8_t* o = &buf[((size_t)y * T + x) * 4];
+            o[0] = p.r; o[1] = p.g; o[2] = p.b; o[3] = p.a;
         }
+        g_frame[l] = makeFrame(buf, T, T);
     }
-    if (g_ffDownloading.exchange(true)) return;
-    std::thread([] {
-        notify("GD Clipper: downloading ffmpeg (90MB)...");
-        std::wstring ps =
-            L"powershell -NoProfile -ExecutionPolicy Bypass -Command \""
-            L"$ProgressPreference='SilentlyContinue';"
-            L"[Net.ServicePointManager]::SecurityProtocol='Tls12';"
-            L"Invoke-WebRequest 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile 'ff.zip';"
-            L"Expand-Archive 'ff.zip' 'ffx' -Force;"
-            L"Copy-Item (Get-ChildItem 'ffx' -Recurse -Filter ffmpeg.exe | Select-Object -First 1).FullName 'ffmpeg.exe';"
-            L"Remove-Item 'ff.zip'; Remove-Item 'ffx' -Recurse\"";
-        run(ps, saveDir(), true);
-        std::error_code ec;
-        if (fs::exists(ffmpegExe(), ec)) { g_ffReady = true; notify("GD Clipper: ffmpeg ready"); }
-        else notify("GD Clipper: ffmpeg download failed", false);
-        g_ffDownloading = false;
-    }).detach();
-}
 
-// ---- game window rectangle (physical pixels) --------------------------------------------------------
-struct Rect { int x, y, w, h; };
-
-static BOOL CALLBACK enumProc(HWND h, LPARAM lp) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(h, &pid);
-    if (pid == GetCurrentProcessId() && IsWindowVisible(h) && GetWindow(h, GW_OWNER) == nullptr) {
-        RECT r;
-        if (GetClientRect(h, &r) && r.right - r.left >= 200) { *(HWND*)lp = h; return FALSE; }
+    // glow = white silhouette of all layers, grown by ~1.5 units, on a slightly bigger texture
+    int pad = (std::max)(2, (int)std::ceil(1.5f * csf));
+    int G = T + pad * 2;
+    std::vector<uint8_t> solid((size_t)G * G, 0);
+    for (int y = 0; y < T; y++) for (int x = 0; x < T; x++) {
+        int i = (y * N / T) * N + (x * N / T);
+        if (g_icon[0][i].a > 40 || g_icon[1][i].a > 40 || g_icon[2][i].a > 40) solid[(size_t)(y + pad) * G + x + pad] = 1;
     }
-    return TRUE;
-}
-
-static bool windowRect(Rect& out) {
-    auto old = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);   // real pixels even with 125% scaling
-    HWND hwnd = nullptr;
-    EnumWindows(enumProc, (LPARAM)&hwnd);
-    bool ok = false;
-    if (hwnd && !IsIconic(hwnd)) {
-        RECT r;
-        POINT p{0, 0};
-        GetClientRect(hwnd, &r);
-        ClientToScreen(hwnd, &p);
-        int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-        int x0 = p.x < 0 ? 0 : p.x, y0 = p.y < 0 ? 0 : p.y;
-        int x1 = p.x + (r.right - r.left), y1 = p.y + (r.bottom - r.top);
-        if (x1 > sw) x1 = sw;
-        if (y1 > sh) y1 = sh;
-        int w = (x1 - x0) & ~1, h = (y1 - y0) & ~1;               // even size for yuv420p
-        if (w >= 200 && h >= 200) { out = {x0, y0, w, h}; ok = true; }
-    }
-    if (old) SetThreadDpiAwarenessContext(old);
-    return ok;
-}
-
-// ---- in-game capture: read the game's own framebuffer and pipe raw frames to ffmpeg ----------------
-// Works in exclusive fullscreen, on any monitor / GPU, with any DPI scaling, because nothing is grabbed from the desktop.
-struct Grab {
-    HANDLE pipe = nullptr;                        // write end of ffmpeg's stdin
-    int w = 0, h = 0;
-    double interval = 1.0 / 60.0, last = 0.0;
-    std::atomic<bool> alive{true};
-    std::mutex mx;
-    std::condition_variable cv;
-    std::deque<std::vector<uint8_t>> q;           // frames waiting to be written (max 2, extra frames are dropped)
-    std::vector<std::vector<uint8_t>> pool;       // reused buffers
-};
-static std::mutex g_grabMx;
-static std::shared_ptr<Grab> g_grab;
-
-static void grabWriter(std::shared_ptr<Grab> g) {
-    for (;;) {
-        std::vector<uint8_t> buf;
-        {
-            std::unique_lock lk(g->mx);
-            g->cv.wait(lk, [&] { return !g->q.empty() || !g->alive; });
-            if (!g->alive) break;
-            buf = std::move(g->q.front());
-            g->q.pop_front();
+    std::vector<uint8_t> glow((size_t)G * G * 4, 0);
+    for (int y = 0; y < G; y++) for (int x = 0; x < G; x++) {
+        bool on = false;
+        for (int dy = -pad; dy <= pad && !on; dy++) for (int dx = -pad; dx <= pad; dx++) {
+            if (dx * dx + dy * dy > pad * pad) continue;
+            int xx = x + dx, yy = y + dy;
+            if (xx >= 0 && yy >= 0 && xx < G && yy < G && solid[(size_t)yy * G + xx]) { on = true; break; }
         }
-        size_t off = 0;
-        while (off < buf.size() && g->alive) {
-            DWORD chunk = (DWORD)((buf.size() - off) > (4u << 20) ? (4u << 20) : (buf.size() - off)), w = 0;
-            if (!WriteFile(g->pipe, buf.data() + off, chunk, &w, nullptr) || w == 0) { g->alive = false; break; }
-            off += w;
-        }
-        std::lock_guard lk(g->mx);
-        if (g->pool.size() < 3) g->pool.push_back(std::move(buf));
+        if (on) { uint8_t* o = &glow[((size_t)y * G + x) * 4]; o[0] = o[1] = o[2] = o[3] = 255; }
     }
-    CloseHandle(g->pipe);
+    g_glowFrame = makeFrame(glow, G, G);
 }
 
-// called on the main thread right before every buffer swap
-static void grabFrame() {
-    std::shared_ptr<Grab> g;
-    {
-        std::lock_guard lk(g_grabMx);
-        g = g_grab;
+bool ready() {
+    if (!g_enabled || !g_hasIcon) return false;
+    float csf = CCDirector::sharedDirector()->getContentScaleFactor();
+    if (!g_frame[0] || csf != g_builtScale) buildFrames();   // (re)build lazily, also after a quality change
+    return g_frame[0] && g_frame[1] && g_frame[2];
+}
+
+void putFrame(CCSprite* spr, CCSpriteFrame* fr, CCNode* centerIn) {
+    if (!spr || !fr) return;
+    spr->setDisplayFrame(fr);
+    spr->setBlendFunc({GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA});
+    spr->setVisible(true);
+    if (centerIn && spr->getParent() == centerIn) { auto cs = centerIn->getContentSize(); spr->setPosition(CCPoint(cs.width / 2, cs.height / 2)); }
+}
+
+// Swap the sprites of an icon:  first = color 1, second = color 2 (behind), detail = fixed colors (front)
+void apply(CCSprite* first, CCSprite* second, CCSprite* detail, CCSprite* glow) {
+    if (!first) return;
+    putFrame(first, g_frame[0], nullptr);
+    putFrame(second, g_frame[1], first);
+    putFrame(detail, g_frame[2], first);
+    if (detail) detail->setColor({255, 255, 255});
+    if (glow && g_glowFrame) {
+        bool wasVisible = glow->isVisible();
+        putFrame(glow, g_glowFrame, first);
+        glow->setVisible(wasVisible);       // keep the game's own glow on/off choice
     }
-    if (!g || !g->alive) return;
-    double t = now();
-    if (t - g->last < g->interval) return;
-    g->last = (t - g->last > 4 * g->interval) ? t : g->last + g->interval;
-    auto view = CCDirector::sharedDirector()->getOpenGLView();
-    if (!view) return;
-    auto size = view->getFrameSize();
-    if ((int)size.width < g->w || (int)size.height < g->h) return;      // window got smaller: skip (ffmpeg repeats the last frame)
-    std::vector<uint8_t> buf;
-    {
-        std::lock_guard lk(g->mx);
-        if (g->q.size() >= 2) return;                                    // encoder is behind: drop this frame
-        if (!g->pool.empty()) { buf = std::move(g->pool.back()); g->pool.pop_back(); }
-    }
-    buf.resize((size_t)g->w * g->h * 4);
-    GLint oldAlign = 4;
-    glGetIntegerv(GL_PACK_ALIGNMENT, &oldAlign);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, g->w, g->h, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
-    glPixelStorei(GL_PACK_ALIGNMENT, oldAlign);
-    {
-        std::lock_guard lk(g->mx);
-        g->q.push_back(std::move(buf));
-    }
-    g->cv.notify_one();
 }
 
-static void stopGrab() {
-    std::shared_ptr<Grab> g;
-    {
-        std::lock_guard lk(g_grabMx);
-        g = std::move(g_grab);
-        g_grab = nullptr;
-    }
-    if (g) { g->alive = false; g->cv.notify_all(); }
-}
-
-// must be called on the main thread (reads the GL view size)
-static bool launchIngame(int fps) {
-    auto view = CCDirector::sharedDirector()->getOpenGLView();
-    if (!view) return false;
-    auto size = view->getFrameSize();
-    int w = ((int)size.width) & ~1, h = ((int)size.height) & ~1;
-    if (w < 200 || h < 200) return false;
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof sa;
-    sa.bInheritHandle = TRUE;
-    HANDLE rd = nullptr, wr = nullptr;
-    if (!CreatePipe(&rd, &wr, &sa, 32u << 20)) return false;
-    SetHandleInformation(wr, HANDLE_FLAG_INHERIT, 0);                    // only the read end goes to ffmpeg
-    HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
-    wchar_t in[512];
-    swprintf(in, 512, L" -hide_banner -loglevel error -y -use_wallclock_as_timestamps 1 -f rawvideo -pix_fmt rgba -video_size %dx%d -framerate %d -i pipe:0"
-                      L" -vf vflip,setpts=PTS-STARTPTS -fps_mode cfr -r %d", w, h, fps, fps);
-    std::wstring cmd = q(ffmpegExe()) + in +
-        L" -c:v libx264 -preset ultrafast -crf 20 -pix_fmt yuv420p -force_key_frames \"expr:gte(t,n_forced*2)\""
-        L" -f segment -segment_time 2 -reset_timestamps 1 seg%06d.mp4";
-    STARTUPINFOW si{};
-    si.cb = sizeof si;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = rd;
-    si.hStdOutput = nul;
-    si.hStdError = nul;
-    PROCESS_INFORMATION pi{};
-    std::wstring dir = bufDir().wstring();
-    BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi);
-    CloseHandle(rd);
-    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
-    if (!ok) { log::error("CreateProcess (ingame) failed: {}", GetLastError()); CloseHandle(wr); return false; }
-    CloseHandle(pi.hThread);
-    if (g_job) AssignProcessToJobObject(g_job, pi.hProcess);
-    g_ff = pi.hProcess;
-    auto g = std::make_shared<Grab>();
-    g->pipe = wr; g->w = w; g->h = h; g->interval = 1.0 / fps;
-    {
-        std::lock_guard lk(g_grabMx);
-        g_grab = g;
-    }
-    std::thread(grabWriter, g).detach();
-    log::info("recording started ({}x{} @{}fps, ingame)", w, h, fps);
-    return true;
-}
-
-// ---- recorder -------------------------------------------------------------------------------------
-static void clearBuffer() {
-    std::error_code ec;
-    fs::remove_all(bufDir(), ec);
-    fs::create_directories(bufDir(), ec);
-}
-
-static bool launchRecorder(const std::string& method) {
-    int fps = (int)Mod::get()->getSettingValue<int64_t>("fps");
-    fps = fps >= 60 ? 60 : 30;
-    if (method == "ingame") return launchIngame(fps);
-    Rect r;
-    if (!windowRect(r)) { log::warn("game window not found"); return false; }
-    wchar_t in[512];
-    if (method == "gdigrab")
-        swprintf(in, 512, L"-f gdigrab -framerate %d -draw_mouse 0 -offset_x %d -offset_y %d -video_size %dx%d -i desktop", fps, r.x, r.y, r.w, r.h);
-    else
-        swprintf(in, 512, L"-f lavfi -i ddagrab=output_idx=0:framerate=%d:draw_mouse=0:video_size=%dx%d:offset_x=%d:offset_y=%d,hwdownload,format=bgra", fps, r.w, r.h, r.x, r.y);
-    std::wstring cmd = q(ffmpegExe()) + L" -nostdin -hide_banner -loglevel error -y " + in +
-        L" -c:v libx264 -preset ultrafast -crf 20 -pix_fmt yuv420p -force_key_frames \"expr:gte(t,n_forced*2)\""
-        L" -f segment -segment_time 2 -reset_timestamps 1 seg%06d.mp4";
-    HANDLE h = nullptr;
-    if (!run(cmd, bufDir(), false, &h)) return false;
-    g_ff = h;
-    log::info("recording started ({}x{} @{}fps, {})", r.w, r.h, fps, method);
-    return true;
-}
-
-static void stopLocked() {
-    ++g_session;
-    stopGrab();
-    if (g_ff) { TerminateProcess(g_ff, 0); WaitForSingleObject(g_ff, 2000); CloseHandle(g_ff); g_ff = nullptr; }
-    g_t0 = 0.0;
-}
-
-static void stop(bool discard) {
-    std::lock_guard lk(g_mx);
-    stopLocked();
-    if (discard) clearBuffer();
-}
-
-static void start() {
-    if (!Mod::get()->getSettingValue<bool>("enabled")) return;
-    if (!g_ffReady) { ensureFfmpeg(); if (!g_ffReady) return; }
-    if (g_saving) return;                                    // still writing the previous clip
-    std::lock_guard lk(g_mx);
-    stopLocked();
-    clearBuffer();
-    std::string method = Mod::get()->getSettingValue<std::string>("capture-method");
-    if (g_usedFallback) method = "gdigrab";
-    if (!launchRecorder(method)) { notify("GD Clipper: could not start recording", false); return; }
-    int session = g_session.load();
-    // watcher: learns when the first frame was written, falls back to gdigrab if ddagrab dies, trims the buffer
-    std::thread([session, method] {
-        std::error_code ec;
-        double launched = now();
-        bool announced = false;
-        while (g_session.load() == session) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(g_t0.load() == 0.0 ? 20 : 2000));
-            if (g_session.load() != session) return;
-            if (g_t0.load() == 0.0) {
-                if (fs::exists(bufDir() / segName(0), ec)) {
-                    g_t0 = now();
-                    if (!announced) { notify("GD Clipper: recording"); announced = true; }
-                } else if (now() - launched > 4.0) {
-                    std::lock_guard lk(g_mx);
-                    if (g_session.load() != session) return;
-                    DWORD code = STILL_ACTIVE;
-                    if (g_ff) GetExitCodeProcess(g_ff, &code);
-                    if (code != STILL_ACTIVE && method != "gdigrab") {          // this capture method does not work here
-                        log::warn("{} failed (exit {}), falling back to gdigrab", method, code);
-                        stopGrab();
-                        CloseHandle(g_ff); g_ff = nullptr;
-                        g_usedFallback = true;
-                        clearBuffer();
-                        if (!launchRecorder("gdigrab")) { notify("GD Clipper: recording failed", false); return; }
-                        launched = now();
-                    } else if (code != STILL_ACTIVE) {
-                        notify("GD Clipper: recording failed", false);
-                        return;
-                    }
-                }
-                continue;
-            }
-            if (g_saving) continue;
-            // drop segments older than the buffer limit
-            int keep = (int)(Mod::get()->getSettingValue<int64_t>("buffer-minutes") * 60 / SEG);
-            int newest = (int)((now() - g_t0.load()) / SEG);
-            for (int i = newest - keep - 30; i < newest - keep; ++i)
-                if (i >= 0) fs::remove(bufDir() / segName(i), ec);
-        }
-    }).detach();
-}
-
-// ---- saving ---------------------------------------------------------------------------------------
-static bool writeList(const fs::path& list, int i0, int i1, int* count) {
-    std::error_code ec;
-    std::ofstream f(list);
-    int n = 0;
-    for (int i = i0; i <= i1; ++i) {
-        if (!fs::exists(bufDir() / segName(i), ec)) continue;
-        char b[64];
-        snprintf(b, sizeof b, "file 'seg%06d.mp4'\n", i);      // relative to the list file: no path encoding issues
-        f << b;
-        ++n;
-    }
-    if (count) *count = n;
-    return n > 0;
-}
-
-static void save(double tAttempt, double tComplete, int session) {
-    g_saving = true;
-    double pre = Mod::get()->getSettingValue<double>("pre");
-    double post = Mod::get()->getSettingValue<double>("post");
-    bool full = Mod::get()->getSettingValue<bool>("save-full");
-    int fps = (int)Mod::get()->getSettingValue<int64_t>("fps") >= 60 ? 60 : 30;
-    std::error_code ec;
-    bool okCut = false, okFull = false;
-    double t0 = g_t0.load();
-    if (t0 > 0.0 && g_session.load() == session) {
-        double a = tAttempt - pre - t0, b = tComplete + post - t0;
-        if (a < 0) a = 0;
-        int i0 = (int)(a / SEG), i1 = (int)(b / SEG);
-        // wait until the segment containing the end has been closed (the next one exists)
-        for (int k = 0; k < 150 && g_session.load() == session; ++k) {
-            if (fs::exists(bufDir() / segName(i1 + 1), ec)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        fs::path dir = outDir();
-        fs::create_directories(dir, ec);
-        std::time_t tt = std::time(nullptr);
-        std::tm tm{};
-        localtime_s(&tm, &tt);
-        wchar_t stamp[32];
-        wcsftime(stamp, 32, L"%Y%m%d_%H%M%S", &tm);
-        fs::path cut = dir / (std::wstring(L"GD_clear_") + stamp + L"_cut.mp4");
-        fs::path fullOut = dir / (std::wstring(L"GD_clear_") + stamp + L"_full.mp4");
-
-        // cut version: precise trim, re-encoded
-        if (writeList(bufDir() / "cut.txt", i0, i1, nullptr)) {
-            wchar_t opt[256];
-            swprintf(opt, 256, L" -ss %.3f -t %.3f -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r %d -movflags +faststart ", a - i0 * SEG, b - a, fps);
-            std::wstring cmd = q(ffmpegExe()) + L" -nostdin -hide_banner -loglevel error -y -f concat -safe 0 -i cut.txt" + opt + q(cut);
-            okCut = run(cmd, bufDir(), true);
-        }
-        // full version: stream copy of everything still in the buffer (fast)
-        if (full) {
-            int first = 0;
-            while (first < i1 && !fs::exists(bufDir() / segName(first), ec)) ++first;
-            if (writeList(bufDir() / "full.txt", first, i1, nullptr)) {
-                std::wstring cmd = q(ffmpegExe()) + L" -nostdin -hide_banner -loglevel error -y -f concat -safe 0 -i full.txt -c copy -movflags +faststart " + q(fullOut);
-                okFull = run(cmd, bufDir(), true);
-            }
-        }
-        log::info("saved: cut={} full={}", okCut, okFull);
-    }
-    if (okCut) notify(full && okFull ? "GD Clipper: saved cut + full" : "GD Clipper: clip saved");
-    else notify("GD Clipper: save failed", false);
-    g_saving = false;
-    if (g_stopAfterSave.exchange(false)) stop(true);            // the player left the level while we were saving
-}
-
-static void onComplete(bool practice) {
-    if (practice && !Mod::get()->getSettingValue<bool>("save-practice")) return;
-    if (g_t0.load() == 0.0 || g_saving) return;
-    double tA = g_attempt.load(), tC = now();
-    if (tA == 0.0 || tA > tC) tA = tC - 30.0;
-    int session = g_session.load();
-    notify("GD Clipper: saving clip...");
-    std::thread([tA, tC, session] { save(tA, tC, session); }).detach();
-}
-
-static void onQuit() {
-    if (g_saving) { g_stopAfterSave = true; return; }
-    stop(true);
-}
-
-} // namespace clip
+} // namespace ip
 
 $on_mod(Loaded) {
-    clip::g_job = CreateJobObjectW(nullptr, nullptr);
-    if (clip::g_job) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;   // ffmpeg dies with the game
-        SetInformationJobObject(clip::g_job, JobObjectExtendedLimitInformation, &info, sizeof info);
-    }
-    clip::ensureFfmpeg();
+    ip::load();
 }
 
-class $modify(ClipGLView, CCEGLView) {
-    void swapBuffers() {
-        clip::grabFrame();                 // copy the finished frame before it is shown
-        CCEGLView::swapBuffers();
+// =====================================================================================
+// Hooks: put the drawing on the player's cube
+// =====================================================================================
+class $modify(IPSimplePlayer, SimplePlayer) {
+    void updatePlayerFrame(int id, IconType type) {
+        SimplePlayer::updatePlayerFrame(id, type);
+        // only the cube you currently have selected is replaced (so the rest of the icon kit stays normal)
+        if (type != IconType::Cube || id != GameManager::get()->getPlayerFrame()) return;
+        if (!ip::ready()) return;
+        ip::apply(m_firstLayer, m_secondLayer, m_detailSprite, m_outlineSprite);
     }
 };
 
-class $modify(ClipPlayLayer, PlayLayer) {
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        clip::g_attempt = clip::now();
-        clip::start();
+class $modify(IPPlayerObject, PlayerObject) {
+    void updatePlayerFrame(int frame) {
+        PlayerObject::updatePlayerFrame(frame);
+        if (!ip::ready()) return;
+        ip::apply(m_iconSprite, m_iconSpriteSecondary, m_iconSpriteWhitener, m_iconGlow);
+    }
+};
+
+// =====================================================================================
+// Editor screen
+// =====================================================================================
+class IconPainterLayer : public CCLayer {
+protected:
+    ip::Icon m_icon{};
+    std::vector<ip::Icon> m_undo;
+    int m_layer = 0;                 // 0..2
+    int m_tool = 0;                  // 0 pen, 1 eraser, 2 fill
+    int m_brush = 1;                 // 1..3
+    ccColor3B m_color = {255, 255, 255};
+    bool m_enabled = true;
+    bool m_dirty = false;
+    bool m_drawing = false;
+    int m_lastX = -1, m_lastY = -1;
+
+    CCSprite* m_canvas = nullptr;
+    CCSprite* m_preview = nullptr;
+    CCLabelBMFont* m_status = nullptr;
+    CCLabelBMFont* m_useLabel = nullptr;
+    CCMenu* m_palette = nullptr;
+    ccColor3B m_col1{}, m_col2{};
+    float m_canvasSize = 200.f;
+    CCPoint m_canvasPos{};
+
+    // ---------- helpers ----------
+    static ccColor3B mul(ip::Px const& p, ccColor3B const& tint) {
+        return {(GLubyte)(p.r * tint.r / 255), (GLubyte)(p.g * tint.g / 255), (GLubyte)(p.b * tint.b / 255)};
+    }
+
+    // what the icon looks like with the player's colors (L2 under L1 under L3), on a checkerboard
+    std::vector<uint8_t> composite(bool checker) {
+        using namespace ip;
+        std::vector<uint8_t> buf((size_t)N * N * 4);
+        for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+            float r = 0, g = 0, b = 0, a = 0;
+            if (checker) { float c = ((x / 2 + y / 2) % 2) ? 70.f : 95.f; r = g = b = c; a = 255; }
+            int i = y * N + x;
+            const int order[3] = {1, 0, 2};
+            for (int l : order) {
+                auto const& p = m_icon[l][i];
+                if (!p.a) continue;
+                ccColor3B c = l == 0 ? mul(p, m_col1) : l == 1 ? mul(p, m_col2) : ccColor3B{p.r, p.g, p.b};
+                float pa = p.a / 255.f;
+                r = c.r * pa + r * (1 - pa); g = c.g * pa + g * (1 - pa); b = c.b * pa + b * (1 - pa);
+                a = (std::max)(a, (float)p.a);
+            }
+            uint8_t* o = &buf[(size_t)i * 4];
+            o[0] = (uint8_t)r; o[1] = (uint8_t)g; o[2] = (uint8_t)b; o[3] = (uint8_t)a;
+        }
+        return buf;
+    }
+
+    void setSpriteTexture(CCSprite* spr, std::vector<uint8_t> const& buf, float size) {
+        auto tex = ip::makeTexture(buf, ip::N, ip::N);
+        auto sz = tex->getContentSize();
+        spr->setTexture(tex);
+        spr->setTextureRect(CCRect(0, 0, sz.width, sz.height));
+        spr->setBlendFunc({GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA});
+        spr->setScale(size / sz.width);
+    }
+
+    void redraw() {
+        setSpriteTexture(m_canvas, composite(true), m_canvasSize);
+        setSpriteTexture(m_preview, composite(false), 34.f);
+    }
+
+    void updateStatus() {
+        static const char* layerNames[3] = {"L1  (COLOR 1)", "L2  (COLOR 2, BEHIND)", "L3  (FIXED COLORS, FRONT)"};
+        static const char* toolNames[3] = {"PEN", "ERASER", "FILL"};
+        m_status->setString(fmt::format("{}   |   {}   |   SIZE {}", layerNames[m_layer], toolNames[m_tool], m_brush).c_str());
+        m_useLabel->setString(m_enabled ? "USE: ON" : "USE: OFF");
+        m_useLabel->setColor(m_enabled ? ccColor3B{120, 255, 120} : ccColor3B{255, 120, 120});
+    }
+
+    void pushUndo() {
+        m_undo.push_back(m_icon);
+        if (m_undo.size() > 30) m_undo.erase(m_undo.begin());
+        m_dirty = true;
+    }
+
+    void plot(int x, int y) {
+        using namespace ip;
+        int lo = -(m_brush - 1) / 2, hi = m_brush / 2;
+        for (int dy = lo; dy <= hi; dy++) for (int dx = lo; dx <= hi; dx++) {
+            int xx = x + dx, yy = y + dy;
+            if (xx < 0 || yy < 0 || xx >= N || yy >= N) continue;
+            m_icon[m_layer][yy * N + xx] = m_tool == 1 ? Px{} : Px{m_color.r, m_color.g, m_color.b, 255};
+        }
+    }
+
+    void line(int x0, int y0, int x1, int y1) {   // Bresenham so fast strokes have no gaps
+        int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;
+        for (;;) {
+            plot(x0, y0);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    }
+
+    void fill(int x, int y) {
+        using namespace ip;
+        auto& L = m_icon[m_layer];
+        Px target = L[y * N + x], rep{m_color.r, m_color.g, m_color.b, 255};
+        auto same = [](Px const& a, Px const& b) { return a.a == b.a && (a.a == 0 || (a.r == b.r && a.g == b.g && a.b == b.b)); };
+        if (same(target, rep)) return;
+        std::vector<int> stack{y * N + x};
+        while (!stack.empty()) {
+            int i = stack.back(); stack.pop_back();
+            if (!same(L[i], target)) continue;
+            L[i] = rep;
+            int cx = i % N, cy = i / N;
+            if (cx > 0) stack.push_back(i - 1);
+            if (cx < N - 1) stack.push_back(i + 1);
+            if (cy > 0) stack.push_back(i - N);
+            if (cy < N - 1) stack.push_back(i + N);
+        }
+    }
+
+    bool touchToPixel(CCTouch* t, int& px, int& py) {
+        CCPoint p = t->getLocation();
+        float half = m_canvasSize / 2;
+        float fx = (p.x - (m_canvasPos.x - half)) / m_canvasSize, fy = (p.y - (m_canvasPos.y - half)) / m_canvasSize;
+        if (fx < 0 || fy < 0 || fx >= 1 || fy >= 1) return false;
+        px = (int)(fx * ip::N); py = ip::N - 1 - (int)(fy * ip::N);
         return true;
     }
 
-    void resetLevel() {
-        PlayLayer::resetLevel();
-        clip::g_attempt = clip::now();
+    // ---------- touch ----------
+    bool ccTouchBegan(CCTouch* t, CCEvent*) override {
+        int x, y;
+        if (!touchToPixel(t, x, y)) return false;
+        pushUndo();
+        if (m_tool == 2) fill(x, y); else plot(x, y);
+        m_drawing = m_tool != 2; m_lastX = x; m_lastY = y;
+        redraw();
+        return true;
+    }
+    void ccTouchMoved(CCTouch* t, CCEvent*) override {
+        int x, y;
+        if (!m_drawing || !touchToPixel(t, x, y)) return;
+        if (x == m_lastX && y == m_lastY) return;
+        line(m_lastX, m_lastY, x, y);
+        m_lastX = x; m_lastY = y;
+        redraw();
+    }
+    void ccTouchEnded(CCTouch*, CCEvent*) override { m_drawing = false; }
+    void ccTouchCancelled(CCTouch*, CCEvent*) override { m_drawing = false; }
+    void registerWithTouchDispatcher() override {
+        CCDirector::sharedDirector()->getTouchDispatcher()->addTargetedDelegate(this, 0, true);
     }
 
-    void levelComplete() {
-        bool practice = m_isPracticeMode;
-        PlayLayer::levelComplete();
-        clip::onComplete(practice);
+    // ---------- palette ----------
+    void rebuildPalette() {
+        m_palette->removeAllChildren();
+        std::vector<ccColor3B> cols;
+        if (m_layer < 2) {
+            // tinted layers: you only choose how bright the area is; the hue comes from your player color
+            cols = {{255, 255, 255}, {200, 200, 200}, {150, 150, 150}, {100, 100, 100}};
+        } else {
+            cols = {{0, 0, 0}, {255, 255, 255}, {128, 128, 128}, {64, 64, 64},
+                    {255, 40, 40}, {255, 140, 0}, {255, 220, 0}, {120, 255, 60},
+                    {0, 170, 60}, {0, 220, 255}, {40, 90, 255}, {150, 60, 255},
+                    {255, 80, 200}, {255, 190, 150}, {140, 80, 30}, {70, 40, 20}};
+        }
+        ccColor3B tint = m_layer == 0 ? m_col1 : m_layer == 1 ? m_col2 : ccColor3B{255, 255, 255};
+        int i = 0;
+        for (auto const& c : cols) {
+            auto spr = CCSprite::createWithSpriteFrameName("GJ_colorBtn_001.png");
+            if (!spr) spr = CCSprite::create("square02b_001.png");
+            if (!spr) continue;
+            spr->setScale(0.55f);
+            spr->setColor({(GLubyte)(c.r * tint.r / 255), (GLubyte)(c.g * tint.g / 255), (GLubyte)(c.b * tint.b / 255)});
+            auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(IconPainterLayer::onColor));
+            btn->setTag(i);
+            btn->setPosition({(float)(i % 4) * 24.f, -(float)(i / 4) * 24.f});
+            m_palette->addChild(btn);
+            i++;
+        }
+        m_paletteColors = cols;
+        m_color = cols[0];
+    }
+    std::vector<ccColor3B> m_paletteColors;
+
+    // ---------- buttons ----------
+    void onColor(CCObject* s) {
+        int i = static_cast<CCNode*>(s)->getTag();
+        if (i >= 0 && i < (int)m_paletteColors.size()) m_color = m_paletteColors[i];
+        if (m_tool == 1) m_tool = 0;
+        updateStatus();
+    }
+    void onLayer(CCObject* s) { m_layer = static_cast<CCNode*>(s)->getTag(); rebuildPalette(); updateStatus(); }
+    void onTool(CCObject* s) { m_tool = static_cast<CCNode*>(s)->getTag(); updateStatus(); }
+    void onBrush(CCObject*) { m_brush = m_brush % 3 + 1; updateStatus(); }
+    void onUndo(CCObject*) {
+        if (m_undo.empty()) return;
+        m_icon = m_undo.back(); m_undo.pop_back();
+        redraw();
+    }
+    void onClear(CCObject*) { pushUndo(); m_icon[m_layer].fill(ip::Px{}); redraw(); }
+    void onUse(CCObject*) { m_enabled = !m_enabled; m_dirty = true; updateStatus(); }
+
+    void onImport(CCObject*) {
+#ifdef GEODE_IS_WINDOWS
+        wchar_t path[1024] = L"";
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = GetActiveWindow();
+        ofn.lpstrFilter = L"Images (*.jpg;*.jpeg;*.png;*.bmp)\0*.jpg;*.jpeg;*.png;*.bmp\0All files\0*.*\0";
+        ofn.lpstrFile = path;
+        ofn.nMaxFile = 1024;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&ofn)) return;
+
+        FILE* f = _wfopen(path, L"rb");
+        if (!f) { showMsg("Could not open that file."); return; }
+        std::vector<uint8_t> bytes;
+        uint8_t chunk[65536]; size_t n;
+        while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) bytes.insert(bytes.end(), chunk, chunk + n);
+        fclose(f);
+
+        int w = 0, h = 0, comp = 0;
+        uint8_t* img = stbi_load_from_memory(bytes.data(), (int)bytes.size(), &w, &h, &comp, 4);
+        if (!img || w < 1 || h < 1) { if (img) stbi_image_free(img); showMsg("That image could not be read.\nUse JPG, PNG or BMP."); return; }
+
+        // centre-crop to a square, then average down to N x N
+        using namespace ip;
+        int side = (std::min)(w, h), ox = (w - side) / 2, oy = (h - side) / 2;
+        pushUndo();
+        for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+            int x0 = ox + x * side / N, x1 = (std::max)(x0 + 1, ox + (x + 1) * side / N);
+            int y0 = oy + y * side / N, y1 = (std::max)(y0 + 1, oy + (y + 1) * side / N);
+            double r = 0, g = 0, b = 0, a = 0; int cnt = 0;
+            for (int yy = y0; yy < y1 && yy < h; yy++) for (int xx = x0; xx < x1 && xx < w; xx++) {
+                const uint8_t* p = &img[((size_t)yy * w + xx) * 4];
+                double pa = p[3] / 255.0;
+                r += p[0] * pa; g += p[1] * pa; b += p[2] * pa; a += p[3]; cnt++;
+            }
+            Px out{};
+            if (cnt && a > 0) {
+                double asum = a / 255.0;
+                out = {(uint8_t)(r / asum), (uint8_t)(g / asum), (uint8_t)(b / asum), (uint8_t)((a / cnt) > 127 ? 255 : 0)};
+            }
+            m_icon[2][y * N + x] = out;
+        }
+        stbi_image_free(img);
+        m_layer = 2; rebuildPalette(); updateStatus(); redraw();
+#else
+        showMsg("Image import is Windows only.");
+#endif
     }
 
-    void onQuit() {
-        clip::onQuit();
-        PlayLayer::onQuit();
+    void showMsg(const char* text) { FLAlertLayer::create("Icon Painter", text, "OK")->show(); }
+
+    void leave() {
+        CCDirector::sharedDirector()->replaceScene(CCTransitionFade::create(0.4f, GJGarageLayer::scene()));
+    }
+    void onSave(CCObject*) {
+        ip::g_icon = m_icon;
+        ip::g_enabled = m_enabled;
+        ip::save();
+        ip::buildFrames();
+        leave();
+    }
+    void onBack(CCObject*) { leave(); }      // leave without saving
+    void keyBackClicked() override { leave(); }
+
+    CCMenuItemSpriteExtra* textBtn(const char* text, SEL_MenuHandler sel, int tag, const char* bg = "GJ_button_04.png", float scale = 0.6f) {
+        auto spr = ButtonSprite::create(text, "bigFont.fnt", bg, 0.7f);
+        spr->setScale(scale);
+        auto btn = CCMenuItemSpriteExtra::create(spr, this, sel);
+        btn->setTag(tag);
+        return btn;
+    }
+
+    bool init() override {
+        if (!CCLayer::init()) return false;
+        auto win = CCDirector::sharedDirector()->getWinSize();
+        auto gm = GameManager::get();
+        m_col1 = gm->colorForIdx(gm->getPlayerColor());
+        m_col2 = gm->colorForIdx(gm->getPlayerColor2());
+        m_icon = ip::g_icon;
+        m_enabled = ip::g_hasIcon ? ip::g_enabled : true;
+
+        auto bg = CCSprite::create("GJ_gradientBG.png");
+        if (bg) {
+            bg->setAnchorPoint({0, 0});
+            bg->setScaleX(win.width / bg->getContentSize().width);
+            bg->setScaleY(win.height / bg->getContentSize().height);
+            bg->setColor({40, 50, 90});
+            this->addChild(bg, -10);
+        }
+
+        auto title = CCLabelBMFont::create("Icon Painter", "goldFont.fnt");
+        title->setScale(0.7f);
+        title->setPosition({win.width / 2, win.height - 16});
+        this->addChild(title);
+
+        // canvas
+        m_canvasSize = (std::min)(210.f, win.height - 90.f);
+        m_canvasPos = {win.width / 2, win.height / 2 + 6};
+        auto frame = CCLayerColor::create({0, 0, 0, 160}, m_canvasSize + 8, m_canvasSize + 8);
+        frame->setPosition({m_canvasPos.x - m_canvasSize / 2 - 4, m_canvasPos.y - m_canvasSize / 2 - 4});
+        this->addChild(frame);
+        m_canvas = CCSprite::create();
+        m_canvas->setPosition(m_canvasPos);
+        this->addChild(m_canvas, 1);
+
+        m_status = CCLabelBMFont::create("", "chatFont.fnt");
+        m_status->setScale(0.75f);
+        m_status->setPosition({win.width / 2, m_canvasPos.y - m_canvasSize / 2 - 14});
+        this->addChild(m_status);
+
+        auto menu = CCMenu::create();
+        menu->setPosition({0, 0});
+        this->addChild(menu, 2);
+
+        // left column: layers + tools
+        float lx = m_canvasPos.x - m_canvasSize / 2 - 62, y = win.height - 50;
+        auto addLeft = [&](CCMenuItemSpriteExtra* b) { b->setPosition({lx, y}); menu->addChild(b); y -= 27; };
+        addLeft(textBtn("L1 COL1", menu_selector(IconPainterLayer::onLayer), 0, "GJ_button_01.png"));
+        addLeft(textBtn("L2 COL2", menu_selector(IconPainterLayer::onLayer), 1, "GJ_button_01.png"));
+        addLeft(textBtn("L3 FREE", menu_selector(IconPainterLayer::onLayer), 2, "GJ_button_01.png"));
+        y -= 6;
+        addLeft(textBtn("PEN", menu_selector(IconPainterLayer::onTool), 0));
+        addLeft(textBtn("ERASER", menu_selector(IconPainterLayer::onTool), 1));
+        addLeft(textBtn("FILL", menu_selector(IconPainterLayer::onTool), 2));
+        addLeft(textBtn("SIZE", menu_selector(IconPainterLayer::onBrush), 0));
+        addLeft(textBtn("UNDO", menu_selector(IconPainterLayer::onUndo), 0));
+        addLeft(textBtn("CLEAR", menu_selector(IconPainterLayer::onClear), 0, "GJ_button_06.png"));
+
+        // right column: palette, preview, import, use, save
+        float rx = m_canvasPos.x + m_canvasSize / 2 + 26;
+        m_palette = CCMenu::create();
+        m_palette->setPosition({rx, win.height - 50});
+        this->addChild(m_palette, 2);
+
+        auto pvLabel = CCLabelBMFont::create("PREVIEW", "chatFont.fnt");
+        pvLabel->setScale(0.6f);
+        pvLabel->setPosition({rx + 36, win.height - 152});
+        this->addChild(pvLabel);
+        m_preview = CCSprite::create();
+        m_preview->setPosition({rx + 36, win.height - 178});
+        this->addChild(m_preview, 1);
+
+        auto imp = textBtn("IMG (JPG/PNG)", menu_selector(IconPainterLayer::onImport), 0, "GJ_button_02.png", 0.5f);
+        imp->setPosition({rx + 36, win.height - 214});
+        menu->addChild(imp);
+
+        m_useLabel = CCLabelBMFont::create("USE: ON", "bigFont.fnt");
+        m_useLabel->setScale(0.45f);
+        auto use = CCMenuItemSpriteExtra::create(m_useLabel, this, menu_selector(IconPainterLayer::onUse));
+        use->setPosition({rx + 36, win.height - 240});
+        menu->addChild(use);
+
+        auto saveBtn = textBtn("SAVE", menu_selector(IconPainterLayer::onSave), 0, "GJ_button_01.png", 0.8f);
+        saveBtn->setPosition({rx + 36, 30});
+        menu->addChild(saveBtn);
+
+        auto backSpr = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
+        if (backSpr) {
+            auto back = CCMenuItemSpriteExtra::create(backSpr, this, menu_selector(IconPainterLayer::onBack));
+            back->setPosition({25, win.height - 25});
+            menu->addChild(back);
+        }
+
+        rebuildPalette();
+        updateStatus();
+        redraw();
+
+        this->setTouchEnabled(true);
+        this->setKeypadEnabled(true);
+        return true;
+    }
+
+public:
+    static IconPainterLayer* create() {
+        auto ret = new IconPainterLayer();
+        if (ret->init()) { ret->autorelease(); return ret; }
+        delete ret;
+        return nullptr;
+    }
+    static CCScene* scene() {
+        auto sc = CCScene::create();
+        sc->addChild(IconPainterLayer::create());
+        return sc;
+    }
+};
+
+// =====================================================================================
+// Garage button
+// =====================================================================================
+class $modify(IPGarage, GJGarageLayer) {
+    bool init() {
+        if (!GJGarageLayer::init()) return false;
+        auto win = CCDirector::sharedDirector()->getWinSize();
+        auto spr = ButtonSprite::create("DRAW", "bigFont.fnt", "GJ_button_03.png", 0.7f);
+        spr->setScale(0.65f);
+        auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(IPGarage::onPainter));
+        auto menu = CCMenu::create();
+        menu->setPosition({win.width - 42, win.height / 2 + 62});
+        menu->addChild(btn);
+        menu->setID("painter-menu"_spr);
+        this->addChild(menu, 20);
+        return true;
+    }
+    void onPainter(CCObject*) {
+        CCDirector::sharedDirector()->replaceScene(CCTransitionFade::create(0.4f, IconPainterLayer::scene()));
     }
 };

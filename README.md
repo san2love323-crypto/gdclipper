@@ -1,22 +1,23 @@
-# GD Clipper (Geode 모드, 단독 실행)
+# Icon Painter — 지메 안에서 직접 그리는 커스텀 아이콘 (Geode 모드, 2.2091)
 
-앱 없이 이 모드만으로 동작. 맵에 들어가면 녹화 시작 → 클리어하면 `_cut.mp4`(클리어한 시도) + `_full.mp4`(입장~클리어 전체) 저장 → 못 깨고 나가면 삭제.
-첫 실행 때 ffmpeg(약 90MB)를 자동으로 받음. 설정은 지오드 메뉴 → GD Clipper → 톱니.
-영상만 녹화됨(소리 없음). AI 컷편집은 아직 앱(gdclipper.py) 쪽에만 있음.
+## 빌드 (명령어 직접 입력 — bat 파일 없음, 스마트 앱 컨트롤에 안 걸림)
+"x64 Native Tools Command Prompt" 에서:
+```
+cd iconpainter 폴더 경로
+cmake -B build -A x64
+cmake --build build --config Release
+```
+→ `build\Release\matjang.iconpainter.geode` 를 `지메폴더\geode\mods\` 에 복사 → 지메 재시작
+(GEODE_SDK 가 없다고 나오면 먼저 `geode sdk install` → 새 창)
 
-## .geode 파일 만들기 (GitHub가 빌드)
-1. github.com 에서 새 레포 생성 (예: gd-clipper-mod)
-2. 이 폴더 내용물을 전부 업로드 (`.github/workflows/build.yml` 포함 - 숨김 폴더 주의)
-3. 레포 Actions 탭 → "Build Geode Mod" 실행이 초록색이 되면 → 맨 아래 Artifacts → `GDClipper-geode` 다운
-4. zip 안의 `yujun566.gdclipper.geode` 가 모드 파일
-
-## 설치
-지메 → 지오드 메뉴 → 왼쪽 "파일에서 설치"(종이+ 아이콘) → `.geode` 선택 → 재시작
-(또는 `Geometry Dash\geode\mods\` 폴더에 직접 복사)
-
-## 버전 맞추기
-`mod.json` 의 `"geode"`, `"gd"` 와 `build.yml` 의 `sdk:` 세 군데를 설치된 버전에 맞춤.
-| 지메 | 지오드 | mod.json geode / gd.win | build.yml sdk |
-|---|---|---|---|
-| 2.2081 | v5.11.2 | 5.11.2 / 2.2081 | v5.11.2 |
-| 2.2074 | v4.10.0 | 4.10.0 / 2.2074 | v4.10.0 |
+## 쓰는 법
+1. 아이콘 창(차고) 오른쪽의 **DRAW** 버튼
+2. 레이어 고르고 그리기
+   - **L1 COL1** : 내 1번 색으로 칠해지는 구역
+   - **L2 COL2** : 내 2번 색으로 칠해지는 구역 (L1 **뒤**에 깔림)
+   - **L3 FREE** : 고정색 (맨 **앞**). 검정 테두리·눈·입·불러온 사진
+   - L1/L2 는 색 대신 밝기 4단계만 고름 (색은 차고에서 고른 색이 입혀짐)
+3. PEN / ERASER / FILL / SIZE(1~3) / UNDO / CLEAR(지금 레이어만)
+4. **IMG (JPG/PNG)** : 사진 불러오기 → 가운데를 정사각형으로 잘라 32x32 로 줄여서 L3 에 들어감
+5. **SAVE** → 지금 고른 큐브가 내 그림으로 바뀜. **USE: OFF** 로 저장하면 원래 아이콘
+6. 왼쪽 위 화살표 / ESC = 저장 안 하고 나가기

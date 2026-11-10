@@ -1,12 +1,7 @@
-# GD Clipper
+# Icon Painter
+Open the Icon Kit (garage) and press the **DRAW** button.
 
-Records the game while you are inside a level. When you **clear** it, two files are saved:
-
-- `GD_clear_<date>_cut.mp4` - only the winning attempt
-- `GD_clear_<date>_full.mp4` - everything since you entered the level (can be turned off)
-
-If you leave the level without clearing, the footage is thrown away. ESC just pauses.
-
-No companion app is needed. On first launch the mod downloads `ffmpeg.exe` (about 90 MB) into its save folder; recording starts working once that has finished.
-
-Video only (no game audio yet). Output folder: `Videos\GD Clips` unless changed in the mod settings.
+- **L1** = painted with your color 1, **L2** = color 2 (drawn *behind* L1), **L3** = fixed colors (on top; use it for outlines, eyes, photos)
+- Tools: pen, eraser, fill, brush size, undo, clear layer
+- **IMG** imports a JPG / PNG / BMP into L3
+- **SAVE** applies it to your current cube. **USE: ON/OFF** switches back to the normal icon.

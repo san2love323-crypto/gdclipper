@@ -3,41 +3,23 @@ name: Build Geode Mod
 on:
   workflow_dispatch:
   push:
-    branches:
-      - "**"
+    branches: ["**"]
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        config:
-          - name: Windows
-            os: windows-latest
-
-    name: ${{ matrix.config.name }}
-    runs-on: ${{ matrix.config.os }}
-
+    name: Windows
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Build the mod
         uses: geode-sdk/build-geode-mod@main
-        with:
-          sdk: v5.11.2          # must match "geode" in mod.json (same major version as your installed Geode)
-          combine: true
-          target: ${{ matrix.config.target }}
-
-  package:
-    name: Package builds
-    runs-on: ubuntu-latest
-    needs: ["build"]
-
-    steps:
-      - uses: geode-sdk/build-geode-mod/combine@main
         id: build
+        with:
+          sdk: v6.0.0-alpha.1   # GD 2.2091 = Geode v6 (mod.json 의 "geode" 와 같아야 함)
+          target: Win64
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GDClipper-geode
+          name: IconPainter
           path: ${{ steps.build.outputs.build-output }}

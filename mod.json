@@ -1,80 +1,10 @@
 {
-	"geode": "5.11.2",
-	"gd": {
-		"win": "2.2081"
-	},
-	"id": "yujun566.gdclipper",
-	"name": "GD Clipper",
-	"version": "v2.1.0",
-	"developer": "yujun566",
-	"description": "Records while you play and saves your clear as mp4 (cut + full version). No extra app needed.",
-	"tags": [
-		"utility",
-		"offline"
-	],
-	"settings": {
-		"enabled": {
-			"name": "Enable recording",
-			"description": "Record while you are inside a level.",
-			"type": "bool",
-			"default": true
-		},
-		"save-full": {
-			"name": "Save full version",
-			"description": "Also save everything from entering the level to the clear (all attempts).",
-			"type": "bool",
-			"default": true
-		},
-		"save-practice": {
-			"name": "Save practice clears",
-			"type": "bool",
-			"default": false
-		},
-		"fps": {
-			"name": "FPS",
-			"type": "int",
-			"default": 60,
-			"min": 30,
-			"max": 60
-		},
-		"pre": {
-			"name": "Seconds before the attempt",
-			"type": "float",
-			"default": 1.0,
-			"min": 0.0,
-			"max": 5.0
-		},
-		"post": {
-			"name": "Seconds after the clear",
-			"type": "float",
-			"default": 2.0,
-			"min": 0.5,
-			"max": 10.0
-		},
-		"buffer-minutes": {
-			"name": "Max minutes kept (full version)",
-			"description": "Older footage of the current level is dropped after this many minutes.",
-			"type": "int",
-			"default": 60,
-			"min": 5,
-			"max": 180
-		},
-		"capture-method": {
-			"name": "Capture method",
-			"description": "ingame reads the picture straight from the game (works in fullscreen, recommended). ddagrab / gdigrab grab the desktop instead - try them only if ingame causes lag.",
-			"type": "string",
-			"default": "ingame",
-			"one-of": [
-				"ingame",
-				"ddagrab",
-				"gdigrab"
-			]
-		},
-		"out-dir": {
-			"name": "Output folder",
-			"description": "Leave empty for Videos\\GD Clips.",
-			"type": "string",
-			"default": ""
-		}
-	}
+  "geode": "6.0.0-alpha.1",
+  "gd": { "win": "2.2091" },
+  "id": "matjang.iconpainter",
+  "name": "Icon Painter",
+  "version": "v1.0.0",
+  "developer": "matjang",
+  "description": "Draw your own cube icon in-game. 3 layers: color 1 area, color 2 area, fixed colors. Import JPG/PNG.",
+  "tags": ["customization"]
 }
