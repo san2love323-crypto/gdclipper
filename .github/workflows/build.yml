@@ -16,7 +16,7 @@ jobs:
         uses: geode-sdk/build-geode-mod@main
         id: build
         with:
-          sdk: v6.0.0-alpha.1   # GD 2.2091 = Geode v6 (mod.json 의 "geode" 와 같아야 함)
+          sdk: v5.9.0   # GD 2.2081 = Geode v5 (mod.json 의 "geode" 와 같아야 함)
           target: Win64
 
       - uses: actions/upload-artifact@v4
