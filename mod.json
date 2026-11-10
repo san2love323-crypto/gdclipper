@@ -1,6 +1,6 @@
 {
-  "geode": "6.0.0-alpha.1",
-  "gd": { "win": "2.2091" },
+  "geode": "5.9.0",
+  "gd": { "win": "2.2081" },
   "id": "matjang.iconpainter",
   "name": "Icon Painter",
   "version": "v1.0.0",
