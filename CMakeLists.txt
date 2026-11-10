@@ -15,4 +15,8 @@ endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
+if (WIN32)
+    target_link_libraries(${PROJECT_NAME} opengl32)
+endif()
+
 setup_geode_mod(${PROJECT_NAME})
